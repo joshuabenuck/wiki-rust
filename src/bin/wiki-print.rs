@@ -44,6 +44,9 @@ fn main() -> Result<(), Error> {
     let site = matches
         .value_of("site")
         .expect("Unable to get value for site");
+    // Instead of writing to a file, start a temporary web server
+    // Wait for a single request and then shutdown.
+    // If the request takes too long to arrive, timeout.
     let mut file = fs::File::create("site.html")?;
     writeln!(
         file,
