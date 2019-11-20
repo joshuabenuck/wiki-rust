@@ -1,5 +1,7 @@
 use clap::{App, AppSettings, Arg};
-use failure::Error;
+use failure::{err_msg, Error};
+use glob::glob;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use std::fs::{create_dir_all, write, File};
@@ -7,6 +9,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{exit, Command};
 use tar::Archive;
+use url::Url;
 use xz2::read::XzDecoder;
 
 #[derive(Deserialize, Serialize)]
@@ -71,33 +74,126 @@ impl WikiConfig {
         create_dir_all(self.canonical_dir())
     }
 
-    fn download_node(&self) -> Result<(), Error> {
-        println!("Downloading nodejs...");
-        let node: PathBuf = self.canonical_dir().join("nodejs.tar.xz");
-        let url = "https://nodejs.org/dist/v12.13.0/node-v12.13.0-linux-x64.tar.xz";
-        let mut resp = reqwest::get(url).expect("Unable to retrieve image from url");
+    fn download_file(&self, url: &Url, dest_file: &PathBuf) -> Result<(), Error> {
+        let mut resp = reqwest::get(url.as_str()).expect("Unable to retrieve image from url");
         assert!(resp.status().is_success());
         let mut buffer = Vec::new();
         resp.read_to_end(&mut buffer)?;
-        write(&node, buffer)?;
+        write(&dest_file, buffer)?;
+        Ok(())
+    }
+
+    fn download_node(&self) -> Result<(), Error> {
+        #[cfg(target_os = "windows")]
+        let url = Url::parse("https://nodejs.org/dist/v12.13.1/node-v12.13.1-win-x64.zip")?;
+        #[cfg(target_os = "linux")]
+        let url = Url::parse("https://nodejs.org/dist/v12.13.0/node-v12.13.0-linux-x64.tar.xz")?;
+        println!("Downloading {}...", &url);
+        let node: PathBuf = self
+            .canonical_dir()
+            .join(url.path_segments().unwrap().last().unwrap());
+        if node.exists() {
+            println!("Skipping node download.");
+            return Ok(());
+        }
+        self.download_file(&url, &node)?;
+        Ok(())
+    }
+
+    fn unzip(&self, zip_file: &PathBuf, dest_dir: &PathBuf) -> Result<(), Error> {
+        // Zip extration taken from example in zip crate.
+        let file = File::open(&zip_file).unwrap();
+
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let outpath = dest_dir.join(file.sanitized_name());
+
+            if (&*file.name()).ends_with('/') {
+                if outpath.exists() {
+                    println!("Skipping extraction.");
+                    break;
+                }
+                debug!(
+                    "File {} extracted to \"{}\"",
+                    i,
+                    outpath.as_path().display()
+                );
+                create_dir_all(&outpath).unwrap();
+            } else {
+                debug!(
+                    "File {} extracted to \"{}\" ({} bytes)",
+                    i,
+                    outpath.as_path().display(),
+                    file.size()
+                );
+                if let Some(p) = outpath.parent() {
+                    if !p.exists() {
+                        create_dir_all(&p).unwrap();
+                    }
+                }
+                let mut outfile = File::create(&outpath).unwrap();
+                io::copy(&mut file, &mut outfile).unwrap();
+            }
+        }
         Ok(())
     }
 
     fn extract_node(&self) -> Result<(), Error> {
         println!("Extracting nodejs...");
-        let tar_gz = File::open(self.canonical_dir().join("nodejs.tar.xz"))?;
-        let tar = XzDecoder::new(tar_gz);
-        let mut archive = Archive::new(tar);
-        archive.unpack(".")?;
-        Ok(())
+        let mut path = None;
+        for entry in glob(self.canonical_dir().join("node*.*").to_str().unwrap())
+            .expect("Failed to read glob pattern")
+        {
+            match entry {
+                Ok(matching_file) => {
+                    if matching_file.is_dir() {
+                        continue;
+                    }
+                    path = Some(matching_file);
+                    break;
+                }
+                Err(e) => panic!("Error while searching for node install: {:?}", e),
+            };
+        }
+        if path.is_none() {
+            panic!("Unable to find node install.");
+        }
+        let path = path.unwrap();
+        if path.to_str().unwrap().contains(&".tar.gz".to_string()) {}
+        if path.to_str().unwrap().contains(&".tar.xz".to_string()) {
+            let tar_gz = File::open(path)?;
+            let tar = XzDecoder::new(tar_gz);
+            let mut archive = Archive::new(tar);
+            archive.unpack(self.canonical_dir())?;
+            return Ok(());
+        }
+        if path.to_str().unwrap().contains(&".zip".to_string()) {
+            self.unzip(&path, &self.canonical_dir())?;
+            return Ok(());
+        }
+        Err(err_msg(format!(
+            "Unrecognized archive file type: {}",
+            path.display()
+        )))
     }
 
-    fn clone_wiki(&self) {}
+    fn download_wiki(&self) -> Result<(), Error> {
+        let url = Url::parse("https://github.com/joshuabenuck/wiki/archive/master.zip")?;
+        let zip_file = self.canonical_dir().join("wiki.zip");
+        println!("Downloading {}...", &url);
+        self.download_file(&url, &zip_file)?;
+        println!("Extracting wiki...");
+        self.unzip(&zip_file, &self.canonical_dir())?;
+        Ok(())
+    }
 
     fn create_wiki(&self) -> Result<(), Error> {
         self.create_folder()?;
         self.download_node()?;
         self.extract_node()?;
+        self.download_wiki()?;
         Ok(())
     }
 }
@@ -137,6 +233,6 @@ fn main() -> Result<(), Error> {
         println!("WARNING: All content of directory will be erased!");
         exit(1);
     }
-    config.create_wiki();
+    config.create_wiki()?;
     Ok(())
 }
