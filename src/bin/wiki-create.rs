@@ -12,6 +12,21 @@ use tar::Archive;
 use url::Url;
 use xz2::read::XzDecoder;
 
+#[derive(Deserialize, Serialize, PartialEq)]
+struct NodeConfig {
+    url: Option<String>,
+    path: Option<PathBuf>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig {
+            url: None,
+            path: None,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct WikiConfig {
     #[serde(default, skip_serializing_if = "is_default")]
@@ -24,6 +39,8 @@ struct WikiConfig {
     client: PathBuf,
     #[serde(default, skip_serializing_if = "is_default")]
     plugins: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    node: NodeConfig,
 }
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
@@ -40,6 +57,10 @@ impl Default for WikiConfig {
             server: "fedwiki/wiki-server".into(),
             client: "fedwiki/wiki-client".into(),
             plugins: Vec::new(),
+            node: NodeConfig {
+                url: None,
+                path: None,
+            },
         }
     }
 }
@@ -83,7 +104,7 @@ impl WikiConfig {
         Ok(())
     }
 
-    fn download_node(&self) -> Result<(), Error> {
+    fn download_node(&mut self) -> Result<(), Error> {
         #[cfg(target_os = "windows")]
         let url = Url::parse("https://nodejs.org/dist/v12.13.1/node-v12.13.1-win-x64.zip")?;
         #[cfg(target_os = "linux")]
@@ -97,14 +118,16 @@ impl WikiConfig {
             return Ok(());
         }
         self.download_file(&url, &node)?;
+        self.node.url = Some(url.into_string());
         Ok(())
     }
 
-    fn unzip(&self, zip_file: &PathBuf, dest_dir: &PathBuf) -> Result<(), Error> {
+    fn unzip(&self, zip_file: &PathBuf, dest_dir: &PathBuf) -> Result<PathBuf, Error> {
         // Zip extration taken from example in zip crate.
         let file = File::open(&zip_file).unwrap();
 
         let mut archive = zip::ZipArchive::new(file).unwrap();
+        let root = archive.by_index(0)?.sanitized_name();
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
@@ -137,10 +160,10 @@ impl WikiConfig {
                 io::copy(&mut file, &mut outfile).unwrap();
             }
         }
-        Ok(())
+        Ok(root)
     }
 
-    fn extract_node(&self) -> Result<(), Error> {
+    fn extract_node(&mut self) -> Result<(), Error> {
         println!("Extracting nodejs...");
         let mut path = None;
         for entry in glob(self.canonical_dir().join("node*.*").to_str().unwrap())
@@ -170,7 +193,7 @@ impl WikiConfig {
             return Ok(());
         }
         if path.to_str().unwrap().contains(&".zip".to_string()) {
-            self.unzip(&path, &self.canonical_dir())?;
+            self.node.path = Some(self.unzip(&path, &self.canonical_dir())?);
             return Ok(());
         }
         Err(err_msg(format!(
@@ -183,17 +206,45 @@ impl WikiConfig {
         let url = Url::parse("https://github.com/joshuabenuck/wiki/archive/master.zip")?;
         let zip_file = self.canonical_dir().join("wiki.zip");
         println!("Downloading {}...", &url);
+        if zip_file.exists() {
+            println!("Skipping wiki download.");
+            return Ok(());
+        }
         self.download_file(&url, &zip_file)?;
         println!("Extracting wiki...");
         self.unzip(&zip_file, &self.canonical_dir())?;
         Ok(())
     }
 
-    fn create_wiki(&self) -> Result<(), Error> {
+    fn install_wiki(&self) -> Result<(), Error> {
+        println!("Installing wiki...");
+        if self.node.path.is_none() {
+            eprintln!("Node installation not found, aborting.");
+            exit(1);
+        }
+        #[cfg(target_os = "windows")]
+        let npm = "npm.cmd".to_owned();
+        #[cfg(target_os = "linux")]
+        let npm = "npm".to_owned();
+        let command_path = self
+            .canonical_dir()
+            .join(self.node.path.as_ref().unwrap())
+            .join(npm);
+        println!("NPM path: {}", command_path.display());
+        let mut command = Command::new(&command_path)
+            .arg("install")
+            .current_dir(self.canonical_dir().join("wiki-master"))
+            .spawn()?;
+        command.wait()?;
+        Ok(())
+    }
+
+    fn create_wiki(&mut self) -> Result<(), Error> {
         self.create_folder()?;
         self.download_node()?;
         self.extract_node()?;
         self.download_wiki()?;
+        self.install_wiki()?;
         Ok(())
     }
 }
@@ -220,7 +271,7 @@ fn main() -> Result<(), Error> {
                 .help("Update existing wiki"),
         )
         .get_matches();
-    let config: WikiConfig = if matches.value_of("config").is_some() {
+    let mut config: WikiConfig = if matches.value_of("config").is_some() {
         let reader = File::open(matches.value_of("config").unwrap())?;
         serde_yaml::from_reader(reader)?
     } else if matches.value_of("dir").is_some() {
