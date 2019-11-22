@@ -4,8 +4,9 @@ use glob::glob;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_yaml;
-use std::fs::{create_dir_all, write, File};
+use std::fs::{create_dir_all, remove_dir_all, write, File};
 use std::io::{self, Read};
+use std::os;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 use tar::Archive;
@@ -202,26 +203,77 @@ impl WikiConfig {
         )))
     }
 
-    fn download_wiki(&self) -> Result<(), Error> {
-        let url = Url::parse("https://github.com/joshuabenuck/wiki/archive/master.zip")?;
-        let zip_file = self.canonical_dir().join("wiki.zip");
+    fn wiki_url(&self) -> Url {
+        Url::parse("https://github.com/joshuabenuck/wiki/archive/master.zip")
+            .expect("Unable to parse wiki url")
+    }
+
+    fn wiki_client_url(&self) -> Url {
+        Url::parse("https://github.com/joshuabenuck/wiki-client/archive/master.zip")
+            .expect("Unable to parse wiki client url")
+    }
+
+    fn wiki_server_url(&self) -> Url {
+        Url::parse("https://github.com/joshuabenuck/wiki-server/archive/master.zip")
+            .expect("Unable to parse wiki server url")
+    }
+
+    fn wiki_zip(&self) -> PathBuf {
+        self.canonical_dir().join("wiki.zip")
+    }
+
+    fn wiki_client_zip(&self) -> PathBuf {
+        self.canonical_dir().join("wiki-client.zip")
+    }
+
+    fn wiki_server_zip(&self) -> PathBuf {
+        self.canonical_dir().join("wiki-server.zip")
+    }
+
+    fn wiki_path(&self) -> PathBuf {
+        // TODO: Compute or get path name from a cache...
+        self.canonical_dir().join("wiki-master")
+    }
+
+    fn wiki_client_path(&self) -> PathBuf {
+        // TODO: Compute or get path name from a cache...
+        self.canonical_dir().join("wiki-client-master")
+    }
+
+    fn wiki_server_path(&self) -> PathBuf {
+        // TODO: Compute or get path name from a cache...
+        self.canonical_dir().join("wiki-server-master")
+    }
+
+    fn download_if_needed(&self, url: &Url, zip_file: &PathBuf) -> Result<(), Error> {
         println!("Downloading {}...", &url);
         if zip_file.exists() {
-            println!("Skipping wiki download.");
+            println!("Skipping download.");
             return Ok(());
         }
         self.download_file(&url, &zip_file)?;
-        println!("Extracting wiki...");
-        self.unzip(&zip_file, &self.canonical_dir())?;
         Ok(())
     }
 
-    fn install_wiki(&self) -> Result<(), Error> {
-        println!("Installing wiki...");
-        if self.node.path.is_none() {
-            eprintln!("Node installation not found, aborting.");
-            exit(1);
-        }
+    fn download_wiki(&self) -> Result<(), Error> {
+        self.download_if_needed(&self.wiki_url(), &self.wiki_zip())?;
+        self.download_if_needed(&self.wiki_client_url(), &self.wiki_client_zip())?;
+        self.download_if_needed(&self.wiki_server_url(), &self.wiki_server_zip())?;
+        Ok(())
+    }
+
+    fn extract_wiki(&self) -> Result<(), Error> {
+        println!("Extracting wiki...");
+        let wiki_zip = self.wiki_zip();
+        self.unzip(&wiki_zip, &self.canonical_dir())?;
+        let wiki_client_zip = self.canonical_dir().join("wiki-client.zip");
+        self.unzip(&wiki_client_zip, &self.canonical_dir())?;
+        let wiki_server_zip = self.canonical_dir().join("wiki-server.zip");
+        self.unzip(&wiki_server_zip, &self.canonical_dir())?;
+        Ok(())
+    }
+
+    fn run_npm_install(&self, dir: &PathBuf) -> Result<(), Error> {
         #[cfg(target_os = "windows")]
         let npm = "npm.cmd".to_owned();
         #[cfg(target_os = "linux")]
@@ -233,9 +285,44 @@ impl WikiConfig {
         println!("NPM path: {}", command_path.display());
         let mut command = Command::new(&command_path)
             .arg("install")
-            .current_dir(self.canonical_dir().join("wiki-master"))
+            .current_dir(dir)
             .spawn()?;
         command.wait()?;
+        Ok(())
+    }
+
+    fn wiki_link(&self, src: &PathBuf, dst: &PathBuf) -> Result<(), Error> {
+        if dst.exists() {
+            println!("Deleting {}...", &dst.display());
+            remove_dir_all(dst)?;
+        }
+        println!("Linking {} to {}...", &src.display(), &dst.display());
+        assert!(src.exists());
+        assert!(!dst.exists());
+        #[cfg(target_os = "windows")]
+        os::windows::fs::symlink_dir(src, dst)?;
+        #[cfg(target_os = "unix")]
+        os::unix::fs::symlink(src, dst)?;
+        Ok(())
+    }
+
+    fn install_wiki(&self) -> Result<(), Error> {
+        println!("Installing wiki...");
+        if self.node.path.is_none() {
+            eprintln!("Node installation not found, aborting.");
+            exit(1);
+        }
+        self.run_npm_install(&self.wiki_path())?;
+        self.run_npm_install(&self.wiki_client_path())?;
+        self.run_npm_install(&self.wiki_server_path())?;
+        self.wiki_link(
+            &self.wiki_client_path(),
+            &self.wiki_path().join("node_modules").join("wiki-client"),
+        )?;
+        self.wiki_link(
+            &self.wiki_server_path(),
+            &self.wiki_path().join("node_modules").join("wiki-server"),
+        )?;
         Ok(())
     }
 
@@ -244,12 +331,41 @@ impl WikiConfig {
         self.download_node()?;
         self.extract_node()?;
         self.download_wiki()?;
+        self.extract_wiki()?;
         self.install_wiki()?;
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), Error> {
+        println!("Deleting wiki install...");
+        if self.exists() {
+            remove_dir_all(self.canonical_dir())?;
+        }
+        Ok(())
+    }
+
+    fn delete_node(&self) -> Result<(), Error> {
+        println!("Deleting node...");
+        if self.node.path.is_some() {
+            let node_path = self.node.path.as_ref().unwrap();
+            if node_path.exists() {
+                remove_dir_all(node_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_wiki(&self) -> Result<(), Error> {
+        println!("Deleting wiki...");
+        let wiki_path = self.canonical_dir().join("wiki-master");
+        if wiki_path.exists() {
+            remove_dir_all(wiki_path)?;
+        }
         Ok(())
     }
 }
 
-fn main() -> Result<(), Error> {
+fn run() -> Result<(), Error> {
     let matches = App::new("wiki-create")
         .about("Utility to create a mostly self-contained wiki install.")
         .setting(AppSettings::ArgRequiredElseHelp)
@@ -270,6 +386,21 @@ fn main() -> Result<(), Error> {
                 .long("update")
                 .help("Update existing wiki"),
         )
+        .arg(
+            Arg::with_name("clean")
+                .long("clean")
+                .help("Delete the wiki config and start anew"),
+        )
+        .arg(
+            Arg::with_name("clean-wiki")
+                .long("clean-wiki")
+                .help("Delete only the wiki install"),
+        )
+        .arg(
+            Arg::with_name("clean-node")
+                .long("clean-node")
+                .help("Delete only the node install"),
+        )
         .get_matches();
     let mut config: WikiConfig = if matches.value_of("config").is_some() {
         let reader = File::open(matches.value_of("config").unwrap())?;
@@ -279,11 +410,29 @@ fn main() -> Result<(), Error> {
     } else {
         exit(1);
     };
+    if matches.is_present("clean") {
+        config.delete()?;
+    }
+    if matches.is_present("clean-wiki") {
+        config.delete_wiki()?;
+    }
+    if matches.is_present("clean-node") {
+        config.delete_node()?;
+    }
     if config.exists() && !matches.is_present("update") {
         println!("Refusing to update existing wiki. Pass --update to force.");
-        println!("WARNING: All content of directory will be erased!");
         exit(1);
     }
     config.create_wiki()?;
     Ok(())
+}
+
+fn main() {
+    match run() {
+        Ok(_) => (),
+        Err(err) => {
+            eprintln!("{}", err);
+            exit(1);
+        }
+    }
 }
