@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_yaml;
 use std::fs::{create_dir_all, remove_dir_all, write, File};
 use std::io::{self, Read};
-use std::os;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 use tar::Archive;
@@ -67,10 +66,11 @@ impl Default for WikiConfig {
 }
 
 impl WikiConfig {
-    fn from_config(config: &str) -> WikiConfig {
-        WikiConfig {
-            ..WikiConfig::default()
-        }
+    fn from_config(config: &str) -> Result<WikiConfig, Error> {
+        let config = config.replace("~", dirs::home_dir().unwrap().to_str().unwrap());
+        let reader = File::open(config)?;
+        let config = serde_yaml::from_reader(reader)?;
+        Ok(config)
     }
 
     fn new(dir: &str) -> WikiConfig {
@@ -89,7 +89,7 @@ impl WikiConfig {
     }
 
     fn exists(&self) -> bool {
-        self.canonical_dir().exists()
+        self.canonical_dir().join("config.yaml").exists()
     }
 
     fn create_folder(&self) -> Result<(), io::Error> {
@@ -273,36 +273,29 @@ impl WikiConfig {
         Ok(())
     }
 
-    fn run_npm_install(&self, dir: &PathBuf) -> Result<(), Error> {
+    fn run_npm(&self, dir: &PathBuf, args: &[&str]) -> Result<(), Error> {
         #[cfg(target_os = "windows")]
         let npm = "npm.cmd".to_owned();
         #[cfg(target_os = "linux")]
         let npm = "npm".to_owned();
         let command_path = self
             .canonical_dir()
-            .join(self.node.path.as_ref().unwrap())
+            .join(
+                self.node
+                    .path
+                    .as_ref()
+                    .expect("Unable to run NPM; No path to node!"),
+            )
             .join(npm);
         println!("NPM path: {}", command_path.display());
-        let mut command = Command::new(&command_path)
-            .arg("install")
-            .current_dir(dir)
-            .spawn()?;
-        command.wait()?;
-        Ok(())
-    }
-
-    fn wiki_link(&self, src: &PathBuf, dst: &PathBuf) -> Result<(), Error> {
-        if dst.exists() {
-            println!("Deleting {}...", &dst.display());
-            remove_dir_all(dst)?;
+        let mut command = Command::new(&command_path);
+        command.arg("--scripts-prepend-node-path=true");
+        for arg in args {
+            command.arg(arg);
         }
-        println!("Linking {} to {}...", &src.display(), &dst.display());
-        assert!(src.exists());
-        assert!(!dst.exists());
-        #[cfg(target_os = "windows")]
-        os::windows::fs::symlink_dir(src, dst)?;
-        #[cfg(target_os = "unix")]
-        os::unix::fs::symlink(src, dst)?;
+        println!("Running {:?}...", command);
+        let mut command = command.current_dir(dir).spawn()?;
+        command.wait()?;
         Ok(())
     }
 
@@ -312,17 +305,17 @@ impl WikiConfig {
             eprintln!("Node installation not found, aborting.");
             exit(1);
         }
-        self.run_npm_install(&self.wiki_path())?;
-        self.run_npm_install(&self.wiki_client_path())?;
-        self.run_npm_install(&self.wiki_server_path())?;
-        self.wiki_link(
-            &self.wiki_client_path(),
-            &self.wiki_path().join("node_modules").join("wiki-client"),
+        self.run_npm(&self.wiki_client_path(), &["install"])?;
+        self.run_npm(&self.wiki_server_path(), &["install"])?;
+        self.run_npm(
+            &self.wiki_path(),
+            &["link", self.wiki_client_path().to_str().unwrap()],
         )?;
-        self.wiki_link(
-            &self.wiki_server_path(),
-            &self.wiki_path().join("node_modules").join("wiki-server"),
+        self.run_npm(
+            &self.wiki_path(),
+            &["link", self.wiki_server_path().to_str().unwrap()],
         )?;
+        self.run_npm(&self.wiki_path(), &["install"])?;
         Ok(())
     }
 
@@ -333,6 +326,28 @@ impl WikiConfig {
         self.download_wiki()?;
         self.extract_wiki()?;
         self.install_wiki()?;
+        self.save()?;
+        Ok(())
+    }
+
+    fn save(&self) -> Result<(), Error> {
+        let file = File::create(self.canonical_dir().join("config.yaml"))?;
+        serde_yaml::to_writer(file, self)?;
+        Ok(())
+    }
+
+    fn run_wiki(&self) -> Result<(), Error> {
+        self.run_npm(
+            &self.wiki_path(),
+            &[
+                "start",
+                "--",
+                "--security_type",
+                "friends",
+                "--cookie_secret",
+                "a secret",
+            ],
+        )?;
         Ok(())
     }
 
@@ -401,12 +416,29 @@ fn run() -> Result<(), Error> {
                 .long("clean-node")
                 .help("Delete only the node install"),
         )
+        .arg(Arg::with_name("run").long("run").help("Run the wiki"))
         .get_matches();
-    let mut config: WikiConfig = if matches.value_of("config").is_some() {
-        let reader = File::open(matches.value_of("config").unwrap())?;
-        serde_yaml::from_reader(reader)?
-    } else if matches.value_of("dir").is_some() {
-        WikiConfig::new(matches.value_of("dir").unwrap())
+    let mut config: WikiConfig = if matches.is_present("config") {
+        let config_path = matches.value_of("config").unwrap();
+        WikiConfig::from_config(config_path).expect("Unable to load specified config")
+    } else if matches.is_present("dir") {
+        let dir: PathBuf = matches.value_of("dir").unwrap().into();
+        let config_path = dir.join("config.yaml");
+        let maybe_config = WikiConfig::from_config(&config_path.to_str().unwrap());
+        match maybe_config {
+            Err(err) => {
+                if config_path.exists() {
+                    return Err(err_msg(format!(
+                        "Unable to parse config file: {}\n{}",
+                        config_path.display(),
+                        err
+                    )));
+                }
+                eprintln!("No wiki config file found: {}.", config_path.display());
+                WikiConfig::new(dir.to_str().unwrap())
+            }
+            Ok(config) => config,
+        }
     } else {
         exit(1);
     };
@@ -419,11 +451,12 @@ fn run() -> Result<(), Error> {
     if matches.is_present("clean-node") {
         config.delete_node()?;
     }
-    if config.exists() && !matches.is_present("update") {
-        println!("Refusing to update existing wiki. Pass --update to force.");
-        exit(1);
+    if !config.exists() || matches.is_present("update") {
+        config.create_wiki()?;
     }
-    config.create_wiki()?;
+    if matches.is_present("run") {
+        config.run_wiki()?;
+    }
     Ok(())
 }
 
