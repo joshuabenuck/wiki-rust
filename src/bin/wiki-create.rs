@@ -2,7 +2,7 @@ use clap::{App, AppSettings, Arg};
 use failure::{err_msg, Error};
 use glob::glob;
 use log::debug;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_yaml;
 use std::fs::{create_dir_all, remove_dir_all, write, File};
 use std::io::{self, Read};
@@ -11,6 +11,86 @@ use std::process::{exit, Command};
 use tar::Archive;
 use url::Url;
 use xz2::read::XzDecoder;
+
+#[derive(PartialEq)]
+struct Branch {
+    path_spec: String,
+}
+
+impl Branch {
+    fn user_repo_branch(&self) -> (&str, &str, &str) {
+        let path_spec = &self.path_spec;
+        let mut parts = path_spec.split(":");
+        let user_repo = parts.next().unwrap();
+        let mut user_repo_parts = user_repo.split("/");
+        let user = user_repo_parts
+            .next()
+            .expect(format!("Unable to find user in {}", path_spec).as_str());
+        let repo = user_repo_parts
+            .next()
+            .expect(format!("Unable to find repo in {}", path_spec).as_str());
+        let branch = parts.next().unwrap_or("master");
+        (user, repo, branch)
+    }
+
+    fn url(&self) -> Url {
+        let (user, repo, branch) = self.user_repo_branch();
+        Url::parse(
+            format!(
+                "https://github.com/{}/{}/archive/{}.zip",
+                user, repo, branch
+            )
+            .as_str(),
+        )
+        .expect("Unable to parse wiki url")
+    }
+
+    fn dir(&self) -> PathBuf {
+        let (_user, repo, branch) = self.user_repo_branch();
+        PathBuf::from(format!("{}-{}", repo, branch))
+    }
+
+    fn zip(&self) -> PathBuf {
+        let (_user, repo, branch) = self.user_repo_branch();
+        PathBuf::from(format!("{}-{}.zip", repo, branch))
+    }
+}
+
+impl Serialize for Branch {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.path_spec.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Branch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Branch {
+            path_spec: Deserialize::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl From<&str> for Branch {
+    fn from(path_spec: &str) -> Self {
+        Branch {
+            path_spec: path_spec.to_owned(),
+        }
+    }
+}
+
+impl Default for Branch {
+    fn default() -> Self {
+        Branch {
+            path_spec: "".to_string(),
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, PartialEq)]
 struct NodeConfig {
@@ -32,13 +112,13 @@ struct WikiConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     dir: PathBuf,
     #[serde(default, skip_serializing_if = "is_default")]
-    wiki: PathBuf,
+    wiki: Branch,
     #[serde(default, skip_serializing_if = "is_default")]
-    server: PathBuf,
+    server: Branch,
     #[serde(default, skip_serializing_if = "is_default")]
-    client: PathBuf,
+    client: Branch,
     #[serde(default, skip_serializing_if = "is_default")]
-    plugins: Vec<PathBuf>,
+    plugins: Vec<Branch>,
     #[serde(default, skip_serializing_if = "is_default")]
     node: NodeConfig,
 }
@@ -203,46 +283,28 @@ impl WikiConfig {
         )))
     }
 
-    fn wiki_url(&self) -> Url {
-        Url::parse("https://github.com/joshuabenuck/wiki/archive/master.zip")
-            .expect("Unable to parse wiki url")
+    fn wiki_dir(&self) -> PathBuf {
+        self.canonical_dir().join(self.wiki.dir())
     }
 
-    fn wiki_client_url(&self) -> Url {
-        Url::parse("https://github.com/joshuabenuck/wiki-client/archive/master.zip")
-            .expect("Unable to parse wiki client url")
+    fn client_dir(&self) -> PathBuf {
+        self.canonical_dir().join(self.client.dir())
     }
 
-    fn wiki_server_url(&self) -> Url {
-        Url::parse("https://github.com/joshuabenuck/wiki-server/archive/master.zip")
-            .expect("Unable to parse wiki server url")
+    fn server_dir(&self) -> PathBuf {
+        self.canonical_dir().join(self.server.dir())
     }
 
     fn wiki_zip(&self) -> PathBuf {
-        self.canonical_dir().join("wiki.zip")
+        self.canonical_dir().join(self.wiki.zip())
     }
 
-    fn wiki_client_zip(&self) -> PathBuf {
-        self.canonical_dir().join("wiki-client.zip")
+    fn client_zip(&self) -> PathBuf {
+        self.canonical_dir().join(self.client.zip())
     }
 
-    fn wiki_server_zip(&self) -> PathBuf {
-        self.canonical_dir().join("wiki-server.zip")
-    }
-
-    fn wiki_path(&self) -> PathBuf {
-        // TODO: Compute or get path name from a cache...
-        self.canonical_dir().join("wiki-master")
-    }
-
-    fn wiki_client_path(&self) -> PathBuf {
-        // TODO: Compute or get path name from a cache...
-        self.canonical_dir().join("wiki-client-master")
-    }
-
-    fn wiki_server_path(&self) -> PathBuf {
-        // TODO: Compute or get path name from a cache...
-        self.canonical_dir().join("wiki-server-master")
+    fn server_zip(&self) -> PathBuf {
+        self.canonical_dir().join(self.server.zip())
     }
 
     fn download_if_needed(&self, url: &Url, zip_file: &PathBuf) -> Result<(), Error> {
@@ -256,20 +318,17 @@ impl WikiConfig {
     }
 
     fn download_wiki(&self) -> Result<(), Error> {
-        self.download_if_needed(&self.wiki_url(), &self.wiki_zip())?;
-        self.download_if_needed(&self.wiki_client_url(), &self.wiki_client_zip())?;
-        self.download_if_needed(&self.wiki_server_url(), &self.wiki_server_zip())?;
+        self.download_if_needed(&self.wiki.url(), &self.wiki_zip())?;
+        self.download_if_needed(&self.client.url(), &self.client_zip())?;
+        self.download_if_needed(&self.server.url(), &self.server_zip())?;
         Ok(())
     }
 
     fn extract_wiki(&self) -> Result<(), Error> {
         println!("Extracting wiki...");
-        let wiki_zip = self.wiki_zip();
-        self.unzip(&wiki_zip, &self.canonical_dir())?;
-        let wiki_client_zip = self.canonical_dir().join("wiki-client.zip");
-        self.unzip(&wiki_client_zip, &self.canonical_dir())?;
-        let wiki_server_zip = self.canonical_dir().join("wiki-server.zip");
-        self.unzip(&wiki_server_zip, &self.canonical_dir())?;
+        self.unzip(&self.wiki_zip(), &self.canonical_dir())?;
+        self.unzip(&self.client_zip(), &self.canonical_dir())?;
+        self.unzip(&self.server_zip(), &self.canonical_dir())?;
         Ok(())
     }
 
@@ -299,23 +358,21 @@ impl WikiConfig {
         Ok(())
     }
 
+    fn link_dep(&self, dir: &PathBuf) -> Result<(), Error> {
+        self.run_npm(dir, &["install"])?;
+        self.run_npm(dir, &["link", self.client_dir().to_str().unwrap()])?;
+        Ok(())
+    }
+
     fn install_wiki(&self) -> Result<(), Error> {
         println!("Installing wiki...");
         if self.node.path.is_none() {
             eprintln!("Node installation not found, aborting.");
             exit(1);
         }
-        self.run_npm(&self.wiki_client_path(), &["install"])?;
-        self.run_npm(&self.wiki_server_path(), &["install"])?;
-        self.run_npm(
-            &self.wiki_path(),
-            &["link", self.wiki_client_path().to_str().unwrap()],
-        )?;
-        self.run_npm(
-            &self.wiki_path(),
-            &["link", self.wiki_server_path().to_str().unwrap()],
-        )?;
-        self.run_npm(&self.wiki_path(), &["install"])?;
+        self.link_dep(&self.client_dir())?;
+        self.link_dep(&self.server_dir())?;
+        self.run_npm(&self.wiki_dir(), &["install"])?;
         Ok(())
     }
 
@@ -338,7 +395,7 @@ impl WikiConfig {
 
     fn run_wiki(&self) -> Result<(), Error> {
         self.run_npm(
-            &self.wiki_path(),
+            &self.wiki_dir(),
             &[
                 "start",
                 "--",
@@ -346,6 +403,7 @@ impl WikiConfig {
                 "friends",
                 "--cookie_secret",
                 "a secret",
+                "--farm",
             ],
         )?;
         Ok(())
