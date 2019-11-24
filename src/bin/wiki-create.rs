@@ -429,10 +429,32 @@ impl WikiConfig {
     }
 
     fn delete_wiki(&self) -> Result<(), Error> {
-        println!("Deleting wiki...");
-        let wiki_path = self.canonical_dir().join("wiki-master");
-        if wiki_path.exists() {
-            remove_dir_all(wiki_path)?;
+        self.delete_wiki_repo()?;
+        self.delete_server_repo()?;
+        self.delete_client_repo()?;
+        Ok(())
+    }
+
+    fn delete_wiki_repo(&self) -> Result<(), Error> {
+        println!("Deleting wiki repo...");
+        if self.wiki_dir().exists() {
+            remove_dir_all(self.wiki_dir())?;
+        }
+        Ok(())
+    }
+
+    fn delete_server_repo(&self) -> Result<(), Error> {
+        println!("Deleting wiki-server repo...");
+        if self.server_dir().exists() {
+            remove_dir_all(self.server_dir())?;
+        }
+        Ok(())
+    }
+
+    fn delete_client_repo(&self) -> Result<(), Error> {
+        println!("Deleting wiki-client repo...");
+        if self.client_dir().exists() {
+            remove_dir_all(self.client_dir())?;
         }
         Ok(())
     }
@@ -460,14 +482,35 @@ fn run() -> Result<(), Error> {
                 .help("Update existing wiki"),
         )
         .arg(
+            Arg::with_name("clean-all")
+                .long("clean-all")
+                .help("Delete the entire wiki site"),
+        )
+        .arg(
             Arg::with_name("clean")
                 .long("clean")
-                .help("Delete the wiki config and start anew"),
+                .help("Delete the wiki install"),
         )
         .arg(
             Arg::with_name("clean-wiki")
                 .long("clean-wiki")
-                .help("Delete only the wiki install"),
+                .help("Delete the wiki repository"),
+        )
+        .arg(
+            Arg::with_name("clean-server")
+                .long("clean-server")
+                .help("Delete the wiki-server repository"),
+        )
+        .arg(
+            Arg::with_name("clean-client")
+                .long("clean-client")
+                .help("Delete the wiki-client repository"),
+        )
+        .arg(
+            Arg::with_name("clean-plugin")
+                .long("clean-plugin")
+                .takes_value(true)
+                .help("Delete the repository for the named plugin"),
         )
         .arg(
             Arg::with_name("clean-node")
@@ -500,11 +543,20 @@ fn run() -> Result<(), Error> {
     } else {
         exit(1);
     };
-    if matches.is_present("clean") {
+    if matches.is_present("clean-all") {
         config.delete()?;
     }
-    if matches.is_present("clean-wiki") {
+    if matches.is_present("clean") {
         config.delete_wiki()?;
+    }
+    if matches.is_present("clean-wiki") {
+        config.delete_wiki_repo()?;
+    }
+    if matches.is_present("clean-server") {
+        config.delete_server_repo()?;
+    }
+    if matches.is_present("clean-client") {
+        config.delete_client_repo()?;
     }
     if matches.is_present("clean-node") {
         config.delete_node()?;
