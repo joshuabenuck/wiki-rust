@@ -1,5 +1,6 @@
 use clap::{App, AppSettings, Arg};
 use failure::{err_msg, Error};
+use git2::Repository;
 use glob::glob;
 use log::debug;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -18,23 +19,43 @@ struct Branch {
 }
 
 impl Branch {
-    fn user_repo_branch(&self) -> (&str, &str, &str) {
-        let path_spec = &self.path_spec;
-        let mut parts = path_spec.split(":");
+    fn auth_user_repo_branch(&self) -> (Option<String>, String, String, String) {
+        let mut path_spec = self.path_spec.clone();
+        let mut auth = None;
+        if path_spec.find(":").is_some() {
+            let mut parts = path_spec.split(":");
+            auth = Some(
+                parts
+                    .next()
+                    .expect("Unable to get auth from path_spec")
+                    .to_owned(),
+            );
+            path_spec = parts
+                .next()
+                .expect("Unable to get user_repo_branch from path_spec")
+                .to_owned();
+        }
+        let mut parts = path_spec.split(";");
         let user_repo = parts.next().unwrap();
         let mut user_repo_parts = user_repo.split("/");
         let user = user_repo_parts
             .next()
-            .expect(format!("Unable to find user in {}", path_spec).as_str());
+            .expect(format!("Unable to find user in {}", path_spec).as_str())
+            .to_owned();
         let repo = user_repo_parts
             .next()
-            .expect(format!("Unable to find repo in {}", path_spec).as_str());
-        let branch = parts.next().unwrap_or("master");
-        (user, repo, branch)
+            .expect(format!("Unable to find repo in {}", path_spec).as_str())
+            .to_owned();
+        let branch = parts.next().unwrap_or("master").to_owned();
+        (auth, user, repo, branch)
     }
 
-    fn url(&self) -> Url {
-        let (user, repo, branch) = self.user_repo_branch();
+    fn git_info(&self) -> (Option<String>, String, String, String) {
+        self.auth_user_repo_branch()
+    }
+
+    fn archive_url(&self) -> Url {
+        let (_auth, user, repo, branch) = self.auth_user_repo_branch();
         Url::parse(
             format!(
                 "https://github.com/{}/{}/archive/{}.zip",
@@ -46,12 +67,12 @@ impl Branch {
     }
 
     fn dir(&self) -> PathBuf {
-        let (_user, repo, branch) = self.user_repo_branch();
+        let (_auth, _user, repo, branch) = self.auth_user_repo_branch();
         PathBuf::from(format!("{}-{}", repo, branch))
     }
 
     fn zip(&self) -> PathBuf {
-        let (_user, repo, branch) = self.user_repo_branch();
+        let (_auth, _user, repo, branch) = self.auth_user_repo_branch();
         PathBuf::from(format!("{}-{}.zip", repo, branch))
     }
 }
@@ -307,6 +328,24 @@ impl WikiConfig {
         self.canonical_dir().join(self.server.zip())
     }
 
+    fn clone_if_needed(
+        &self,
+        (auth, user, repo, branch): (&str, &str, &str, &str),
+    ) -> Result<(), Error> {
+        println!("Cloning {}:{}/{};{}...", auth, user, repo, branch);
+        let dir = self.canonical_dir().join(repo);
+        if dir.exists() {
+            println!("Skipping clone.");
+            return Ok(());
+        }
+        let _repo = match Repository::clone(format!("{}:{}", user, repo).as_str(), dir) {
+            Ok(repo) => repo,
+            Err(e) => panic!("failed to clone: {}", e),
+        };
+        // repo.find_branch(branch, BranchType::Local)
+        Ok(())
+    }
+
     fn download_if_needed(&self, url: &Url, zip_file: &PathBuf) -> Result<(), Error> {
         println!("Downloading {}...", &url);
         if zip_file.exists() {
@@ -318,17 +357,27 @@ impl WikiConfig {
     }
 
     fn download_wiki(&self) -> Result<(), Error> {
-        self.download_if_needed(&self.wiki.url(), &self.wiki_zip())?;
-        self.download_if_needed(&self.client.url(), &self.client_zip())?;
-        self.download_if_needed(&self.server.url(), &self.server_zip())?;
-        Ok(())
-    }
-
-    fn extract_wiki(&self) -> Result<(), Error> {
-        println!("Extracting wiki...");
-        self.unzip(&self.wiki_zip(), &self.canonical_dir())?;
-        self.unzip(&self.client_zip(), &self.canonical_dir())?;
-        self.unzip(&self.server_zip(), &self.canonical_dir())?;
+        let info = self.wiki.git_info();
+        if info.0.is_some() {
+            self.clone_if_needed((&info.0.unwrap(), &info.1, &info.2, &info.3))?;
+        } else {
+            self.download_if_needed(&self.wiki.archive_url(), &self.wiki_zip())?;
+            self.unzip(&self.wiki_zip(), &self.canonical_dir())?;
+        }
+        let info = self.client.git_info();
+        if info.0.is_some() {
+            self.clone_if_needed((&info.0.unwrap(), &info.1, &info.2, &info.3))?;
+        } else {
+            self.download_if_needed(&self.client.archive_url(), &self.client_zip())?;
+            self.unzip(&self.client_zip(), &self.canonical_dir())?;
+        }
+        let info = self.server.git_info();
+        if info.0.is_some() {
+            self.clone_if_needed((&info.0.unwrap(), &info.1, &info.2, &info.3))?;
+        } else {
+            self.download_if_needed(&self.server.archive_url(), &self.server_zip())?;
+            self.unzip(&self.server_zip(), &self.canonical_dir())?;
+        }
         Ok(())
     }
 
@@ -381,7 +430,6 @@ impl WikiConfig {
         self.download_node()?;
         self.extract_node()?;
         self.download_wiki()?;
-        self.extract_wiki()?;
         self.install_wiki()?;
         self.save()?;
         Ok(())
